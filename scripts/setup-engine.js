@@ -1,7 +1,11 @@
 // Copies the Stockfish 18 WASM engine binaries from node_modules into
-// engine/ so the unpacked extension can load them. The engine/ folder is
-// git-ignored — run `npm install` (which triggers this via postinstall)
-// or `npm run setup` after cloning.
+// engine/ so the extension can load them. The engine/ folder is git-ignored
+// — run `npm install` (which triggers this via postinstall) or
+// `npm run setup` after cloning.
+//
+// The single-threaded NNUE .wasm (~108 MB) exceeds AMO's per-file size
+// limit inside an .xpi, so it is SPLIT into 56 MB parts here. At runtime
+// engine/loader.js reassembles them in memory (see scripts/main.js).
 "use strict";
 
 const fs = require("fs");
@@ -10,36 +14,45 @@ const path = require("path");
 const SRC = path.join(__dirname, "..", "node_modules", "stockfish", "bin");
 const DEST = path.join(__dirname, "..", "engine");
 
-const FILES = [
-  // Multi-threaded NNUE build (preferred; needs SharedArrayBuffer).
-  "stockfish-18.js",
-  "stockfish-18.wasm",
-  // Single-threaded NNUE fallback (works everywhere).
-  "stockfish-18-single.js",
-  "stockfish-18-single.wasm",
-];
+const GLUE = "stockfish-18-single.js";
+const WASM = "stockfish-18-single.wasm";
+const PART_BYTES = 56 * 1024 * 1024; // stay well under AMO's per-file cap
 
 function main() {
   if (!fs.existsSync(SRC)) {
     console.error(
-      "[chesscheat] stockfish package not found in node_modules. " +
-        "Run `npm install` first."
+      "[chessable] stockfish package not found in node_modules. Run `npm install` first."
     );
     process.exit(1);
   }
 
   fs.mkdirSync(DEST, { recursive: true });
 
-  for (const file of FILES) {
-    const from = path.join(SRC, file);
-    if (!fs.existsSync(from)) {
-      console.error(`[chesscheat] missing engine binary: ${file}`);
-      process.exit(1);
-    }
-    fs.copyFileSync(from, path.join(DEST, file));
-    console.log(`[chesscheat] copied ${file} -> engine/`);
+  fs.copyFileSync(path.join(SRC, GLUE), path.join(DEST, GLUE));
+  console.log(`[chessable] copied ${GLUE} -> engine/`);
+
+  // The loader worker source lives in scripts/ (committed); it must ship at
+  // engine/loader.js inside the extension, next to the engine glue.
+  fs.copyFileSync(
+    path.join(__dirname, "engine-loader.js"),
+    path.join(DEST, "loader.js")
+  );
+  console.log("[chessable] wrote loader.js -> engine/");
+
+  const buf = fs.readFileSync(path.join(SRC, WASM));
+  const parts = Math.ceil(buf.length / PART_BYTES);
+  for (let i = 0; i < parts; i++) {
+    const name = `stockfish-18-single.wasm.part-${String(i + 1).padStart(2, "0")}`;
+    fs.writeFileSync(
+      path.join(DEST, name),
+      buf.subarray(i * PART_BYTES, Math.min((i + 1) * PART_BYTES, buf.length))
+    );
+    console.log(`[chessable] wrote ${name} (${PART_BYTES / 1048576} MB max)`);
   }
-  console.log("[chesscheat] engine ready. Load the extension via chrome://extensions.");
+
+  console.log(
+    `[chessable] engine ready: ${parts} parts, ${buf.length} bytes total.`
+  );
 }
 
 main();

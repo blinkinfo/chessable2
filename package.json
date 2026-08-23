@@ -1,6 +1,6 @@
 {
   "name": "chessable",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Subtle Stockfish 18 (NNUE) best-move overlay for chess.com.",
   "scripts": {
     "setup": "node scripts/setup-engine.js",
