@@ -39,6 +39,18 @@ function main() {
   );
   console.log("[chessable] wrote loader.js -> engine/");
 
+  // Hidden extension page that hosts the worker (Firefox blocks content
+  // scripts from creating workers on moz-extension:// URLs).
+  fs.copyFileSync(
+    path.join(__dirname, "engine-host.html"),
+    path.join(DEST, "host.html")
+  );
+  fs.copyFileSync(
+    path.join(__dirname, "engine-host.js"),
+    path.join(DEST, "host.js")
+  );
+  console.log("[chessable] wrote host.html + host.js -> engine/");
+
   const buf = fs.readFileSync(path.join(SRC, WASM));
   const parts = Math.ceil(buf.length / PART_BYTES);
   for (let i = 0; i < parts; i++) {
