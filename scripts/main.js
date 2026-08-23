@@ -14,7 +14,7 @@
   const FILES = "abcdefgh";
   const MULTI_PV = 1;          // single principal variation (fastest)
   const HASH_MB = 192;         // transposition table size
-  const ENGINE_READY_TIMEOUT_MS = 12000;
+  const ENGINE_READY_TIMEOUT_MS = 12000;   // x3 in launch(): big binary on phones
   const SYNC_DEBOUNCE_MS = 150;
   const RENDER_THROTTLE_MS = 100;
 
@@ -237,28 +237,56 @@
     if (engineCtl.worker) engineCtl.worker.postMessage(cmd);
   }
 
-  // Prefer the multi-threaded build (needs SharedArrayBuffer); fall back to
-  // the single-threaded NNUE build which runs everywhere.
+  // Single-threaded Stockfish 18 NNUE build, loaded through engine/loader.js:
+  // the .wasm ships split into parts (AMO caps per-file size inside an .xpi),
+  // so we reassemble it in memory and hand it to the worker as wasmBinary.
+  const WASM_PARTS = [
+    "engine/stockfish-18-single.wasm.part-01",
+    "engine/stockfish-18-single.wasm.part-02",
+  ];
+
+  async function loadWasmBinary() {
+    const buffers = [];
+    let total = 0;
+    for (const part of WASM_PARTS) {
+      const res = await fetch(chrome.runtime.getURL(part));
+      if (!res.ok) throw new Error(`missing engine part ${part} (run npm install)`);
+      const buf = await res.arrayBuffer();
+      buffers.push(buf);
+      total += buf.byteLength;
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const buf of buffers) {
+      out.set(new Uint8Array(buf), offset);
+      offset += buf.byteLength;
+    }
+    return out.buffer;
+  }
+
   function startEngine() {
     if (engineCtl.ready) return Promise.resolve(true);
     if (engineLaunch) return engineLaunch;
 
-    const wantThreads = typeof SharedArrayBuffer !== "undefined";
-    engineLaunch = launch(wantThreads)
-      .catch(() => (wantThreads ? launch(false) : Promise.reject(new Error("engine failed"))))
-      .then(
-        (ok) => { engineLaunch = null; return ok; },
-        (err) => { engineLaunch = null; throw err; }
-      );
+    engineLaunch = launch().then(
+      (ok) => { engineLaunch = null; return ok; },
+      (err) => { engineLaunch = null; throw err; }
+    );
     return engineLaunch;
   }
 
-  function launch(threads) {
+  async function launch() {
+    let bin;
+    try {
+      bin = await loadWasmBinary();
+    } catch (err) {
+      throw new Error(`could not load engine parts: ${err.message}`);
+    }
+
     return new Promise((resolve, reject) => {
-      const file = threads ? "engine/stockfish-18.js" : "engine/stockfish-18-single.js";
       let worker;
       try {
-        worker = new Worker(chrome.runtime.getURL(file));
+        worker = new Worker(chrome.runtime.getURL("engine/loader.js"));
       } catch (err) {
         reject(err);
         return;
@@ -274,9 +302,10 @@
         reject(new Error(why));
       };
 
+      // Generous timeout: parsing a ~108 MB binary takes a moment on phones.
       const timer = setTimeout(
-        () => fail(`engine did not initialise (${threads ? "threads" : "single"})`),
-        ENGINE_READY_TIMEOUT_MS
+        () => fail("engine did not initialise"),
+        ENGINE_READY_TIMEOUT_MS * 3
       );
 
       worker.onerror = () => fail("worker error");
@@ -284,9 +313,9 @@
       worker.onmessage = ({ data }) => {
         const line = String(data);
         if (line.startsWith("uciok")) {
-          configure(worker, threads);
+          configure(worker);
           engineCtl.worker = worker;
-          engineCtl.threads = threads;
+          engineCtl.threads = false;
           engineCtl.ready = true;
           clearTimeout(timer);
           resolve(true);
@@ -295,16 +324,15 @@
         handleEngineLine(line);
       };
 
+      // The loader buffers UCI commands sent before the glue is ready, so we
+      // can safely queue "uci" right after handing over the binary.
+      worker.postMessage({ wasmBinary: bin }, [bin]);
       worker.postMessage("uci");
     });
   }
 
-  function configure(worker, threads) {
+  function configure(worker) {
     const send = (cmd) => worker.postMessage(cmd);
-    if (threads) {
-      const cores = Math.max(1, Math.min((navigator.hardwareConcurrency || 2) - 1, 8));
-      send(`setoption name Threads value ${cores}`);
-    }
     send(`setoption name Hash value ${HASH_MB}`);
     send(`setoption name MultiPV value ${MULTI_PV}`);
     send("isready");
