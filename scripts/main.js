@@ -48,7 +48,7 @@
   let uiTimer = null;
   let engineLaunch = null;              // in-flight launch promise
 
-  const engineCtl = { worker: null, ready: false, threads: false };
+  const engineCtl = { host: null, ready: false };   // host = engine iframe's window
 
   /* ------------------------------------------------------------------ */
   /* Board reading                                                       */
@@ -234,36 +234,14 @@
   /* ------------------------------------------------------------------ */
 
   function post(cmd) {
-    if (engineCtl.worker) engineCtl.worker.postMessage(cmd);
+    if (engineCtl.host)
+      engineCtl.host.postMessage({ __chessableEngine: true, payload: cmd }, "*");
   }
 
-  // Single-threaded Stockfish 18 NNUE build, loaded through engine/loader.js:
-  // the .wasm ships split into parts (AMO caps per-file size inside an .xpi),
-  // so we reassemble it in memory and hand it to the worker as wasmBinary.
-  const WASM_PARTS = [
-    "engine/stockfish-18-single.wasm.part-01",
-    "engine/stockfish-18-single.wasm.part-02",
-  ];
-
-  async function loadWasmBinary() {
-    const buffers = [];
-    let total = 0;
-    for (const part of WASM_PARTS) {
-      const res = await fetch(chrome.runtime.getURL(part));
-      if (!res.ok) throw new Error(`missing engine part ${part} (run npm install)`);
-      const buf = await res.arrayBuffer();
-      buffers.push(buf);
-      total += buf.byteLength;
-    }
-    const out = new Uint8Array(total);
-    let offset = 0;
-    for (const buf of buffers) {
-      out.set(new Uint8Array(buf), offset);
-      offset += buf.byteLength;
-    }
-    return out.buffer;
-  }
-
+  // Firefox does not let content scripts spawn Workers on moz-extension://
+  // URLs, so the engine lives inside a hidden extension-page iframe
+  // (engine/host.html). The page fetches the split wasm parts same-origin,
+  // starts the loader worker itself, and bridges messages both ways.
   function startEngine() {
     if (engineCtl.ready) return Promise.resolve(true);
     if (engineLaunch) return engineLaunch;
@@ -275,67 +253,62 @@
     return engineLaunch;
   }
 
-  async function launch() {
-    let bin;
-    try {
-      bin = await loadWasmBinary();
-    } catch (err) {
-      throw new Error(`could not load engine parts: ${err.message}`);
-    }
-
+  function launch() {
     return new Promise((resolve, reject) => {
-      let worker;
-      try {
-        worker = new Worker(chrome.runtime.getURL("engine/loader.js"));
-      } catch (err) {
-        reject(err);
-        return;
-      }
+      const iframe = document.createElement("iframe");
+      iframe.style.cssText = "display:none;width:0;height:0;border:0;";
+      iframe.src = chrome.runtime.getURL("engine/host.html");
 
-      const fail = (why) => {
-        clearTimeout(timer);
-        worker.terminate();
-        if (engineCtl.worker === worker) {
-          engineCtl.worker = null;
-          engineCtl.ready = false;
-        }
-        reject(new Error(why));
-      };
-
-      // Generous timeout: parsing a ~108 MB binary takes a moment on phones.
+      // Generous timeout: fetching/parsing a ~108 MB binary takes a moment
+      // on phones.
       const timer = setTimeout(
         () => fail("engine did not initialise"),
-        ENGINE_READY_TIMEOUT_MS * 3
+        ENGINE_READY_TIMEOUT_MS * 4
       );
 
-      worker.onerror = () => fail("worker error");
+      function fail(why) {
+        clearTimeout(timer);
+        window.removeEventListener("message", onHostMessage);
+        iframe.remove();
+        engineCtl.host = null;
+        reject(new Error(why));
+      }
 
-      worker.onmessage = ({ data }) => {
-        const line = String(data);
+      function onHostMessage({ data, source }) {
+        if (!data || !data.__chessableEngine || source !== iframe.contentWindow)
+          return;
+        const line = String(data.payload);
+
+        if (line.startsWith("__engine-error")) {
+          console.error("[chessable]", line);
+          fail(line.slice(15) || "worker error");
+          return;
+        }
+        if (line === "__host-ready") {
+          // Worker is up and holds the binary; command channel open.
+          engineCtl.host = iframe.contentWindow;
+          return;
+        }
         if (line.startsWith("uciok")) {
-          configure(worker);
-          engineCtl.worker = worker;
-          engineCtl.threads = false;
+          configure();
           engineCtl.ready = true;
           clearTimeout(timer);
+          window.removeEventListener("message", onHostMessage);   // keep iframe!
           resolve(true);
           return;
         }
         handleEngineLine(line);
-      };
+      }
 
-      // The loader buffers UCI commands sent before the glue is ready, so we
-      // can safely queue "uci" right after handing over the binary.
-      worker.postMessage({ wasmBinary: bin }, [bin]);
-      worker.postMessage("uci");
+      window.addEventListener("message", onHostMessage);
+      document.documentElement.appendChild(iframe);
     });
   }
 
-  function configure(worker) {
-    const send = (cmd) => worker.postMessage(cmd);
-    send(`setoption name Hash value ${HASH_MB}`);
-    send(`setoption name MultiPV value ${MULTI_PV}`);
-    send("isready");
+  function configure() {
+    post(`setoption name Hash value ${HASH_MB}`);
+    post(`setoption name MultiPV value ${MULTI_PV}`);
+    post("isready");
   }
 
   function handleEngineLine(line) {
@@ -639,7 +612,7 @@
       await startEngine();
     } catch (err) {
       console.error("[chessable]", err);
-      alert("Chessable could not load its engine. Run `npm install` first \u2014 see readme.md.");
+      alert("Chessable could not start its engine. Reload the page and try again \u2014 if it keeps failing, close other apps (the engine needs ~300 MB of free memory).");
     } finally {
       starting = false;
     }
