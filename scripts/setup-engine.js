@@ -41,7 +41,7 @@ function main() {
   // Remove artifacts from older packaging schemes so stale files can never
   // be picked up or shipped by accident.
   for (const f of fs.readdirSync(DEST)) {
-    if (f !== GLUE && f !== WASM && f !== "host.html" && f !== "host.js") {
+    if (f !== GLUE && f !== WASM) {
       fs.rmSync(path.join(DEST, f), { force: true });
       console.log(`[chessable] removed stale engine/${f}`);
     }
@@ -65,17 +65,7 @@ function main() {
   const mb = (fs.statSync(path.join(DEST, WASM)).size / 1048576).toFixed(1);
   console.log(`[chessable] wrote engine/${WASM} (${mb} MB)`);
 
-  // 3. Hidden extension page that hosts the engine worker (Firefox blocks
-  //    content scripts from creating workers on moz-extension:// URLs).
-  fs.copyFileSync(
-    path.join(__dirname, "engine-host.html"),
-    path.join(DEST, "host.html")
-  );
-  fs.copyFileSync(
-    path.join(__dirname, "engine-host.js"),
-    path.join(DEST, "host.js")
-  );
-  console.log("[chessable] wrote host.html + host.js -> engine/");
+  console.log("[chessable] engine ready (hosted by scripts/engine-bg.js)");
 }
 
 main();
