@@ -7,7 +7,12 @@
 // The glue detects worker mode via `typeof importScripts` (setup-engine.js
 // patches the upstream check, which relied on a URL fragment that Firefox
 // strips from Worker URLs) and fetches its sibling .wasm same-origin.
-// The 7.3 MB lite binary compiles in a second or two, even on phones.
+//
+// IMPORTANT: we receive engine output via addEventListener, NOT
+// `worker.onmessage = ...`. The glue initialises its UCI command dispatcher
+// with `onmessage = onmessage || fn` — if we claim the onmessage slot before
+// the glue evaluates, it silently skips installing its dispatcher and UCI
+// commands never reach the engine. addEventListener leaves the slot free.
 //
 // Traffic is bridged to the content script via window.postMessage under a
 // namespaced token so chess.com page scripts can never confuse it.
@@ -22,15 +27,15 @@ function ccSend(payload) {
 try {
   var worker = new Worker("./stockfish-18-lite-single.js");
 
-  worker.onmessage = function (e) {
+  worker.addEventListener("message", function (e) {
     ccSend(String(e.data));
-  };
-  worker.onerror = function (e) {
-    ccSend("__engine-error: " + (e && e.message ? e.message : "engine worker crashed"));
-  };
-  worker.onmessageerror = function () {
-    ccSend("__engine-error: worker message could not be decoded");
-  };
+  });
+  worker.addEventListener("error", function (e) {
+    ccSend(
+      "__engine-error: " +
+        (e && e.message ? e.message : "engine worker crashed")
+    );
+  });
 
   window.addEventListener("message", function (e) {
     var d = e.data;
