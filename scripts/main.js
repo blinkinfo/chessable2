@@ -288,8 +288,11 @@
           return;
         }
         if (line === "__host-ready") {
-          // Worker is up and holds the binary; command channel open.
+          // Worker is up; command channel open. Kick off the UCI handshake —
+          // Stockfish only replies "uciok" AFTER receiving "uci", so without
+          // this the boot silently hangs until the readiness guard fires.
           engineCtl.host = iframe.contentWindow;
+          post("uci");
           return;
         }
         if (line.startsWith("uciok")) {
