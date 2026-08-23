@@ -31,16 +31,9 @@ function main() {
   fs.copyFileSync(path.join(SRC, GLUE), path.join(DEST, GLUE));
   console.log(`[chessable] copied ${GLUE} -> engine/`);
 
-  // The loader worker source lives in scripts/ (committed); it must ship at
-  // engine/loader.js inside the extension, next to the engine glue.
-  fs.copyFileSync(
-    path.join(__dirname, "engine-loader.js"),
-    path.join(DEST, "loader.js")
-  );
-  console.log("[chessable] wrote loader.js -> engine/");
-
-  // Hidden extension page that hosts the worker (Firefox blocks content
-  // scripts from creating workers on moz-extension:// URLs).
+  // Hidden extension page that hosts the engine worker (Firefox blocks
+  // content scripts from creating workers on moz-extension:// URLs). It
+  // reassembles the split wasm and boots the glue with its blob URL.
   fs.copyFileSync(
     path.join(__dirname, "engine-host.html"),
     path.join(DEST, "host.html")
