@@ -2,8 +2,8 @@
 # Packages Chessable for Firefox (including Firefox for Android) as a .xpi.
 #
 # The .xpi contains only what Firefox needs:
-#   - manifest.json, icons, scripts/main.js
-#   - engine/host.html + engine/host.js (hidden page hosting the worker)
+#   - manifest.json, icons, scripts/main.js, scripts/engine-bg.js
+#     (background page hosting the engine worker)
 #   - the Stockfish 18 LITE NNUE build (~7.3 MB wasm, whole — no splitting,
 #     well under AMO's per-file limit; boots in seconds on phones)
 #
@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 OUT="chessable-firefox.xpi"
 
 for f in manifest.json icon-16.png icon-48.png icon-128.png scripts/main.js \
-         engine/host.html engine/host.js \
+         scripts/engine-bg.js \
          engine/stockfish-18-lite-single.js \
          engine/stockfish-18-lite-single.wasm; do
   if [ ! -f "$f" ]; then
@@ -27,7 +27,7 @@ done
 
 rm -f "$OUT"
 zip -q -X "$OUT" manifest.json icon-16.png icon-48.png icon-128.png \
-  scripts/main.js engine/host.html engine/host.js \
+  scripts/main.js scripts/engine-bg.js \
   engine/stockfish-18-lite-single.js \
   engine/stockfish-18-lite-single.wasm
 

@@ -48,7 +48,7 @@
   let uiTimer = null;
   let engineLaunch = null;              // in-flight launch promise
 
-  const engineCtl = { host: null, ready: false };   // host = engine iframe's window
+  const engineCtl = { port: null, ready: false };   // port = background-page channel
 
   /* ------------------------------------------------------------------ */
   /* Board reading                                                       */
@@ -234,14 +234,21 @@
   /* ------------------------------------------------------------------ */
 
   function post(cmd) {
-    if (engineCtl.host)
-      engineCtl.host.postMessage({ __chessableEngine: true, payload: cmd }, "*");
+    if (engineCtl.port) port_post(engineCtl.port, cmd);
   }
 
-  // Firefox does not let content scripts spawn Workers on moz-extension://
-  // URLs, so the engine lives inside a hidden extension-page iframe
-  // (engine/host.html). The page starts the worker itself and bridges
-  // messages both ways.
+  // The engine worker lives in the extension's BACKGROUND page (see
+  // scripts/engine-bg.js). Extension pages can always create Workers, and
+  // runtime ports work identically everywhere — no dependence on chess.com's
+  // DOM, CSP, or whether page-embedded extension iframes survive.
+  function port_post(port, cmd) {
+    try {
+      port.postMessage(cmd);
+    } catch (_) {
+      /* port died mid-search; the disconnect handler takes over */
+    }
+  }
+
   function startEngine() {
     if (engineCtl.ready) return Promise.resolve(true);
     if (engineLaunch) return engineLaunch;
@@ -259,11 +266,9 @@
 
   function launch() {
     return new Promise((resolve, reject) => {
-      const iframe = document.createElement("iframe");
-      iframe.style.cssText = "display:none;width:0;height:0;border:0;";
-      iframe.src = chrome.runtime.getURL("engine/host.html");
+      const p = chrome.runtime.connect({ name: "chessable-engine" });
 
-      // Generous guard: even a cold first load finishes in a few seconds.
+      // Generous guard: even a cold first boot finishes in a few seconds.
       const timer = setTimeout(
         () => fail("engine did not initialise"),
         ENGINE_READY_TIMEOUT_MS
@@ -271,43 +276,47 @@
 
       function fail(why) {
         clearTimeout(timer);
-        window.removeEventListener("message", onHostMessage);
-        iframe.remove();
-        engineCtl.host = null;
+        try { p.disconnect(); } catch (_) {}
+        engineCtl.port = null;
         reject(new Error(why));
       }
 
-      function onHostMessage({ data, source }) {
-        if (!data || !data.__chessableEngine || source !== iframe.contentWindow)
-          return;
-        const line = String(data.payload);
-
-        if (line.startsWith("__engine-error")) {
-          console.error("[chessable]", line);
-          fail(line.slice(15) || "worker error");
+      p.onMessage.addListener((msg) => {
+        if (msg && msg.error) {
+          console.error("[chessable] engine:", msg.error);
+          fail(msg.error);
           return;
         }
-        if (line === "__host-ready") {
-          // Worker is up; command channel open. Kick off the UCI handshake —
-          // Stockfish only replies "uciok" AFTER receiving "uci", so without
-          // this the boot silently hangs until the readiness guard fires.
-          engineCtl.host = iframe.contentWindow;
+        if (msg && msg.ready) {
+          // Worker process exists. Kick off the UCI handshake — Stockfish
+          // only replies "uciok" AFTER receiving "uci".
+          engineCtl.port = p;
           post("uci");
           return;
         }
+        const line = msg ? msg.line : null;
+        if (typeof line !== "string") return;
+
         if (line.startsWith("uciok")) {
           configure();
           engineCtl.ready = true;
           clearTimeout(timer);
-          window.removeEventListener("message", onHostMessage);   // keep iframe!
           resolve(true);
           return;
         }
         handleEngineLine(line);
-      }
+      });
 
-      window.addEventListener("message", onHostMessage);
-      document.documentElement.appendChild(iframe);
+      p.onDisconnect.addListener(() => {
+        clearTimeout(timer);
+        engineCtl.port = null;
+        if (!engineCtl.ready) {
+          reject(new Error("engine host disconnected"));
+        } else {
+          // Background page was suspended; re-arm so the next move boots it.
+          engineCtl.ready = false;
+        }
+      });
     });
   }
 
@@ -663,6 +672,13 @@
     if (!preloadStarted && document.querySelector(".board-layout-main")) {
       preloadStarted = true;
       startEngine().catch(() => {});              // silent: retried on tap
+    }
+    if (S.running) {
+      if (engineCtl.port) {
+        post("__ping");                          // keeps the bg page alive mid-game
+      } else if (!engineLaunch && !S.engineError) {
+        startEngine().catch(showEngineError);     // bg was suspended — re-arm
+      }
     }
     if (S.running && !getBoard()?.isConnected) {
       // Board vanished (game ended / navigated away) — stand down quietly.
