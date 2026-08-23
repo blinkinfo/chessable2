@@ -2,12 +2,12 @@
 # Packages Chessable for Firefox (including Firefox for Android) as a .xpi.
 #
 # The .xpi contains only what Firefox needs:
-#   - manifest.json, icons, scripts/main.js, engine/loader.js
-#   - the single-threaded Stockfish 18 NNUE build (works everywhere), with
-#     the ~108 MB .wasm split into two parts to stay under AMO's per-file
-#     size limit; engine/loader.js reassembles them in memory at runtime.
+#   - manifest.json, icons, scripts/main.js
+#   - engine/host.html + engine/host.js (hidden page hosting the worker)
+#   - the Stockfish 18 LITE NNUE build (~7.3 MB wasm, whole — no splitting,
+#     well under AMO's per-file limit; boots in seconds on phones)
 #
-# Result: ./chessable-firefox.xpi  (~74 MB, under AMO's 200 MB total limit)
+# Result: ./chessable-firefox.xpi  (~4 MB)
 #
 # Run `npm install` first so engine/ exists.
 set -e
@@ -17,9 +17,8 @@ OUT="chessable-firefox.xpi"
 
 for f in manifest.json icon-16.png icon-48.png icon-128.png scripts/main.js \
          engine/host.html engine/host.js \
-         engine/stockfish-18-single.js \
-         engine/stockfish-18-single.wasm.part-01 \
-         engine/stockfish-18-single.wasm.part-02; do
+         engine/stockfish-18-lite-single.js \
+         engine/stockfish-18-lite-single.wasm; do
   if [ ! -f "$f" ]; then
     echo "Missing $f — run 'npm install' (or 'npm run setup') first." >&2
     exit 1
@@ -29,8 +28,7 @@ done
 rm -f "$OUT"
 zip -q -X "$OUT" manifest.json icon-16.png icon-48.png icon-128.png \
   scripts/main.js engine/host.html engine/host.js \
-  engine/stockfish-18-single.js \
-  engine/stockfish-18-single.wasm.part-01 \
-  engine/stockfish-18-single.wasm.part-02
+  engine/stockfish-18-lite-single.js \
+  engine/stockfish-18-lite-single.wasm
 
 echo "Created $OUT ($(du -h "$OUT" | cut -f1))"

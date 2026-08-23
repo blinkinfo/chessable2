@@ -13,8 +13,8 @@
 
   const FILES = "abcdefgh";
   const MULTI_PV = 1;          // single principal variation (fastest)
-  const HASH_MB = 192;         // transposition table size
-  const ENGINE_READY_TIMEOUT_MS = 12000;   // x3 in launch(): big binary on phones
+  const HASH_MB = 64;          // transposition table (phone-friendly)
+  const ENGINE_READY_TIMEOUT_MS = 30000;   // lite engine boots in seconds
   const SYNC_DEBOUNCE_MS = 150;
   const RENDER_THROTTLE_MS = 100;
 
@@ -240,8 +240,8 @@
 
   // Firefox does not let content scripts spawn Workers on moz-extension://
   // URLs, so the engine lives inside a hidden extension-page iframe
-  // (engine/host.html). The page fetches the split wasm parts same-origin,
-  // starts the loader worker itself, and bridges messages both ways.
+  // (engine/host.html). The page starts the worker itself and bridges
+  // messages both ways.
   function startEngine() {
     if (engineCtl.ready) return Promise.resolve(true);
     if (engineLaunch) return engineLaunch;
@@ -263,11 +263,10 @@
       iframe.style.cssText = "display:none;width:0;height:0;border:0;";
       iframe.src = chrome.runtime.getURL("engine/host.html");
 
-      // Generous timeout: fetching/parsing a ~108 MB binary takes a moment
-      // on phones.
+      // Generous guard: even a cold first load finishes in a few seconds.
       const timer = setTimeout(
         () => fail("engine did not initialise"),
-        ENGINE_READY_TIMEOUT_MS * 4
+        ENGINE_READY_TIMEOUT_MS
       );
 
       function fail(why) {
