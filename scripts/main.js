@@ -247,7 +247,11 @@
     if (engineLaunch) return engineLaunch;
 
     engineLaunch = launch().then(
-      (ok) => { engineLaunch = null; return ok; },
+      (ok) => {
+        engineLaunch = null;
+        if (S.running) analyze();               // pick up any pending toggle
+        return ok;
+      },
       (err) => { engineLaunch = null; throw err; }
     );
     return engineLaunch;
@@ -497,6 +501,15 @@
 
     if (refs.depth) refs.depth.value = String(S.depth);
 
+    if (S.engineError) {
+      refs.dot.style.background = "#c0392b";            // red = engine failed
+      refs.move.style.display = "none";
+      refs.eval.style.display = "none";
+      refs.depthInfo.textContent = "tap to retry";
+      refs.depthInfo.style.display = "";
+      return;
+    }
+
     if (!S.running) {
       refs.dot.style.background = "#57534e";            // gray = off
       refs.move.style.display = "none";
@@ -509,7 +522,10 @@
     refs.dot.style.background = S.bestMove ? "#81b64c" : "#d4a72c";
 
     // Live depth confirmation: progress toward the configured target.
-    if (!S.bestMove) {
+    if (!engineCtl.ready) {
+      refs.depthInfo.textContent = "engine\u2026";
+      refs.depthInfo.style.display = "";
+    } else if (!S.bestMove) {
       refs.depthInfo.textContent = best
         ? `searching d${best.depth}/${S.depth}`
         : `target d${S.depth}`;
@@ -596,31 +612,27 @@
   /* Start / stop                                                        */
   /* ------------------------------------------------------------------ */
 
-  let starting = false;
-
-  async function startHack() {
-    if (starting || S.running) return;
+  // One tap: flip on immediately (snappy UI), engine warms up in the
+  // background and the search starts the moment it is ready. No popups.
+  function startHack() {
     const board = getBoard();
-    if (!board) return;
-    starting = true;
-
+    if (!board || S.running) return;
+    S.engineError = false;
     boardEl = board;
     snapshotPosition();
     attachObserver(board);
-
-    try {
-      await startEngine();
-    } catch (err) {
-      console.error("[chessable]", err);
-      alert("Chessable could not start its engine. Reload the page and try again \u2014 if it keeps failing, close other apps (the engine needs ~300 MB of free memory).");
-    } finally {
-      starting = false;
-    }
-    if (!engineCtl.ready) return;
-
     S.running = true;
-    renderPanel();
-    if (S.sideToMove === S.playerColour) analyze();
+    renderPanel();                              // amber dot right away
+    startEngine().catch(showEngineError);
+  }
+
+  function showEngineError(err) {
+    console.error("[chessable]", err);
+    if (!S.running) return;
+    S.running = false;
+    S.engineError = true;
+    clearHighlights();
+    renderPanel();                              // red dot + hint, no alert
   }
 
   function stopHack() {
@@ -640,9 +652,16 @@
   /* ------------------------------------------------------------------ */
 
   ensureUI();
+  // Preload the engine silently in the background as soon as a board page is
+  // detected, so the first tap on the pill analyses instantly.
+  let preloadStarted = false;
   // Cheap heartbeat: survives chess.com SPA navigation / panel removal.
   uiTimer = setInterval(() => {
     ensureUI();
+    if (!preloadStarted && document.querySelector(".board-layout-main")) {
+      preloadStarted = true;
+      startEngine().catch(() => {});              // silent: retried on tap
+    }
     if (S.running && !getBoard()?.isConnected) {
       // Board vanished (game ended / navigated away) — stand down quietly.
       stopHack();

@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 OUT="chessable-firefox.xpi"
 
 for f in manifest.json icon-16.png icon-48.png icon-128.png scripts/main.js \
-         engine/loader.js engine/host.html engine/host.js \
+         engine/host.html engine/host.js \
          engine/stockfish-18-single.js \
          engine/stockfish-18-single.wasm.part-01 \
          engine/stockfish-18-single.wasm.part-02; do
@@ -28,7 +28,7 @@ done
 
 rm -f "$OUT"
 zip -q -X "$OUT" manifest.json icon-16.png icon-48.png icon-128.png \
-  scripts/main.js engine/loader.js engine/host.html engine/host.js \
+  scripts/main.js engine/host.html engine/host.js \
   engine/stockfish-18-single.js \
   engine/stockfish-18-single.wasm.part-01 \
   engine/stockfish-18-single.wasm.part-02
