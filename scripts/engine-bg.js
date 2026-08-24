@@ -20,6 +20,7 @@
 let worker = null;
 let bootWatchdog = null;
 let lastBootInfo = null;      // most recent diagnostic from the boot worker
+const BOOT_SILENCE_MS = 60000; // any worker message resets this — only TRUE silence fires it
 const ports = new Set();
 
 function broadcast(what) {
@@ -43,6 +44,20 @@ function clearBootWatchdog() {
   }
 }
 
+function kickWatchdog() {
+  clearBootWatchdog();
+  bootWatchdog = setTimeout(() => {
+    bootWatchdog = null;
+    broadcast(
+      `engine silent ${BOOT_SILENCE_MS / 1000}s${lastBootInfo ? ` — last: ${lastBootInfo}` : " — no boot diagnostics"}`
+    );
+    if (worker) {
+      try { worker.terminate(); } catch (_) {}
+      worker = null;
+    }
+  }, BOOT_SILENCE_MS);
+}
+
 function ensureWorker(port) {
   if (worker) return true;
   try {
@@ -55,6 +70,7 @@ function ensureWorker(port) {
 
     worker.addEventListener("message", (e) => {
       const d = e.data;
+      kickWatchdog(); // ANY message (boot stage or engine line) = alive
       // Boot diagnostics from the bootstrap worker.
       if (d && typeof d === "object" && typeof d.__boot === "string") {
         lastBootInfo = d.__boot;
@@ -66,6 +82,9 @@ function ensureWorker(port) {
       }
       const line = typeof d === "string" ? d : d && d.data;
       if (typeof line !== "string") return;
+      // The engine answered the UCI handshake — boot is complete, the
+      // silence watchdog has no business watching an idle healthy engine.
+      if (line === "uciok") clearBootWatchdog();
       for (const p of ports) {
         try {
           p.postMessage({ line: String(line) });
@@ -81,19 +100,12 @@ function ensureWorker(port) {
       broadcast("engine produced an undecodable message")
     );
 
-    // Silence watchdog: a healthy lite engine answers "uci" in well under
-    // 10 s even on a phone. If it stays quiet, say so FAST (this is what
-    // used to look like "30 s then red" with zero explanation).
-    bootWatchdog = setTimeout(() => {
-      bootWatchdog = null;
-      broadcast(
-        `engine silent for 15s${lastBootInfo ? ` — last: ${lastBootInfo}` : " — no boot diagnostics"}`
-      );
-      if (worker) {
-        try { worker.terminate(); } catch (_) {}
-        worker = null;
-      }
-    }, 15000);
+    // Silence watchdog — resets on EVERY message from the worker, so a
+    // slow-but-progressing first boot (7 MB fetch + compile on mobile data
+    // can legitimately take 20-30 s) is never killed. Only total silence
+    // for 60 s — a genuinely wedged boot — fires it, and the last boot
+    // stage is included so the pill names exactly where it stopped.
+    kickWatchdog();
 
     console.log("[chessable:bg] engine worker started");
     return true;
