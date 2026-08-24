@@ -441,15 +441,26 @@
     if (!bestUci || bestUci.length < 4) return;
     const board = boardEl && boardEl.isConnected ? boardEl : getBoard();
     if (!board) return;
+    const flipped = board.classList.contains("flipped");
     for (const square of [bestUci.slice(0, 2), bestUci.slice(2, 4)]) {
+      const f = FILES.indexOf(square[0]);
+      const r = Number(square[1]);
+      if (f < 0 || !(r >= 1 && r <= 8)) continue;
+      // Position explicitly (percent of the board) instead of borrowing
+      // chess.com's .highlight CSS, which does not reliably style injected
+      // elements. Flip-aware: chess.com renders rank 8 at the top unless the
+      // board has the "flipped" class.
+      const left = (flipped ? 7 - f : f) * 12.5;
+      const top = (flipped ? r - 1 : 8 - r) * 12.5;
       const el = document.createElement("div");
-      // chess.com positions squares via absolute numeric classes (square-47
-      // = g4) regardless of board flip — same scheme its own move highlights
-      // use, so the overlay inherits correct size and placement automatically.
-      el.className = `highlight cheat-highlight square-${algToClass(square)}`;
+      el.className = "cheat-highlight";
       el.style.cssText =
-        "background:#81b64c !important;opacity:0.55;pointer-events:none;";
-      board.appendChild(el);
+        `position:absolute;left:${left}%;top:${top}%;` +
+        "width:12.5%;height:12.5%;background:#81b64c;opacity:0.5;" +
+        "pointer-events:none;z-index:0;border-radius:2px;";
+      // Insert beneath the pieces (first child) so the move tint sits under
+      // them, exactly like chess.com's own last-move highlights.
+      board.insertBefore(el, board.firstChild);
     }
   }
 

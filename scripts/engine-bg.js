@@ -20,7 +20,7 @@
 let worker = null;
 let bootWatchdog = null;
 let lastBootInfo = null;      // most recent diagnostic from the boot worker
-const BOOT_SILENCE_MS = 60000; // any worker message resets this — only TRUE silence fires it
+const BOOT_SILENCE_MS = 30000; // any worker message resets this — only TRUE silence fires it
 const ports = new Set();
 
 function broadcast(what) {

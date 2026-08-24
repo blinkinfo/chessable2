@@ -36,10 +36,10 @@ if (isMainThread) {
   w.on("error", (e) => done(false, "worker error: " + e.message));
   w.on("exit", (c) => console.log("[worker exited code", c + "]"));
 
-  setTimeout(() => { w.postMessage("uci"); console.error("[main] sent uci"); }, 500);
-  setTimeout(() => w.postMessage("isready"), 700);
-  setTimeout(() => w.postMessage("position startpos moves e2e4 e7e5"), 900);
-  setTimeout(() => w.postMessage("go depth 12"), 1100);
+  setTimeout(() => { w.postMessage("uci"); console.error("[main] sent uci EARLY (before glue load)"); }, 300);
+  setTimeout(() => w.postMessage("isready"), 500);
+  setTimeout(() => w.postMessage("position startpos moves e2e4 e7e5"), 700);
+  setTimeout(() => w.postMessage("go depth 12"), 900);
   setTimeout(() => done(false, "TIMEOUT waiting for bestmove"), 45000);
 } else {
   // ---- browser-worker shim inside the thread ----
@@ -57,7 +57,16 @@ if (isMainThread) {
   // A real dedicated worker has `onmessage` as an IDL attribute with value
   // null — the glue's worker-branch gate is `"undefined"!=typeof onmessage`.
   globalThis.onmessage = null;
+  // Message listeners registered via addEventListener — a real worker
+  // dispatches every incoming message to BOTH these listeners and the
+  // `onmessage` property (when set). boot.js relies on this to queue
+  // commands that arrive before the glue installs its dispatcher.
+  const __msgListeners = [];
   globalThis.addEventListener = (type, fn) => {
+    if (type === "message") {
+      __msgListeners.push(fn);
+      return;
+    }
     // Forward worker error traps to the parent so nothing is swallowed.
     if (type === "unhandledrejection")
       __process.on("unhandledRejection", (r) => parentPort.postMessage("UNHANDLED REJECTION: " + (r && r.stack || r)));
@@ -91,9 +100,14 @@ if (isMainThread) {
       return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
     },
   });
-  // Bridge incoming messages to the glue's onmessage dispatcher.
+  // Bridge incoming messages exactly like a real worker: listeners first,
+  // then the `onmessage` property (if the glue has installed it).
   parentPort.on("message", (m) => {
-    if (typeof globalThis.onmessage === "function") globalThis.onmessage({ data: m });
+    const ev = { data: m };
+    for (const fn of __msgListeners) {
+      try { fn(ev); } catch (e) { parentPort.postMessage("LISTENER THROW: " + e.stack); }
+    }
+    if (typeof globalThis.onmessage === "function") globalThis.onmessage(ev);
   });
 
   try {
@@ -102,22 +116,4 @@ if (isMainThread) {
   } catch (e) {
     parentPort.postMessage("BOOT.JS THROW: " + e.stack);
   }
-
-  // Probes: did the glue's worker branch install onmessage? Did the factory
-  // finish initialising? Manually drive a uci through if so.
-  let probes = 0;
-  const probe = setInterval(() => {
-    probes++;
-    const t = typeof globalThis.onmessage;
-    parentPort.postMessage(`probe#${probes}: onmessage=${t}`);
-    if (t === "function") {
-      try {
-        globalThis.onmessage({ data: "uci" });
-        parentPort.postMessage("probe: manually called onmessage(uci)");
-      } catch (e) {
-        parentPort.postMessage("probe: onmessage THREW: " + e.stack);
-      }
-    }
-    if (probes >= 3) clearInterval(probe);
-  }, 2000);
 }
