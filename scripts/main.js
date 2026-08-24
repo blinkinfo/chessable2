@@ -276,6 +276,7 @@
 
       function fail(why) {
         clearTimeout(timer);
+        S.engineErrorMsg = String(why).slice(0, 42);
         try { p.disconnect(); } catch (_) {}
         engineCtl.port = null;
         reject(new Error(why));
@@ -311,7 +312,8 @@
         clearTimeout(timer);
         engineCtl.port = null;
         if (!engineCtl.ready) {
-          reject(new Error("engine host disconnected"));
+          S.engineErrorMsg = "engine host disconnected";
+          reject(new Error(S.engineErrorMsg));
         } else {
           // Background page was suspended; re-arm so the next move boots it.
           engineCtl.ready = false;
@@ -516,7 +518,7 @@
       refs.dot.style.background = "#c0392b";            // red = engine failed
       refs.move.style.display = "none";
       refs.eval.style.display = "none";
-      refs.depthInfo.textContent = "tap to retry";
+      refs.depthInfo.textContent = `${S.engineErrorMsg || "failed"} \u00b7 retry`;
       refs.depthInfo.style.display = "";
       return;
     }
@@ -629,6 +631,7 @@
     const board = getBoard();
     if (!board || S.running) return;
     S.engineError = false;
+    S.engineErrorMsg = null;
     boardEl = board;
     snapshotPosition();
     attachObserver(board);
