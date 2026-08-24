@@ -17,6 +17,33 @@
 //     remaining silence into a fast, reported failure instead of a hang.
 "use strict";
 
+// Cloud analysis: a real multi-threaded Stockfish on server hardware
+// (chess-api.com — free, no key) answers at far greater depth than a phone
+// can and in a few hundred ms. The content script falls back to the local
+// WASM engine automatically if this fails or times out. Fetched here in
+// the background page, which has host permissions for the endpoint.
+const CLOUD_URL = "https://chess-api.com/v1";
+
+async function cloudEval(fen, depth) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 6000);
+  try {
+    const resp = await fetch(CLOUD_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fen, depth: Number(depth) || 18 }),
+      signal: ctl.signal,
+    });
+    if (!resp.ok) throw new Error(`cloud HTTP ${resp.status}`);
+    const d = await resp.json();
+    if (d && d.type === "error") throw new Error(d.error || "cloud error");
+    if (!d || typeof d.move !== "string") throw new Error("no move in cloud response");
+    return { move: d.move, centipawns: d.centipawns, mate: d.mate, depth: d.depth };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 let worker = null;
 let bootWatchdog = null;
 let lastBootInfo = null;      // most recent diagnostic from the boot worker
@@ -133,6 +160,20 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 
   port.onMessage.addListener((msg) => {
+    // Cloud analysis request — answered from the background page (it has
+    // the host permission; content-script fetches would face page CORS).
+    if (msg && typeof msg === "object" && typeof msg.__cloud === "string") {
+      cloudEval(msg.__cloud, msg.depth)
+        .then((r) => {
+          try { port.postMessage({ cloud: r }); } catch (_) {}
+        })
+        .catch((err) => {
+          try {
+            port.postMessage({ cloudError: String((err && err.message) || err).slice(0, 80) });
+          } catch (_) {}
+        });
+      return;
+    }
     if (!worker) return;
     if (typeof msg !== "string") return;
     if (msg === "__ping") return; // keepalive only — keeps this page alive

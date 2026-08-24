@@ -16,6 +16,8 @@
   const MULTI_PV = 1;          // single principal variation (fastest)
   const HASH_MB = 64;          // transposition table (phone-friendly)
   const MOVETIME_MS = 900;     // per-move thinking budget — keeps hints near-instant
+  const CLOUD_TIMEOUT_MS = 4000;   // cloud answer deadline before falling back to local
+  const SEARCH_WATCHDOG_MS = 15000; // no answer at all -> engine host is wedged, restart it
   const ENGINE_READY_TIMEOUT_MS = 90000;   // max SILENCE during boot; any progress resets it
   const SYNC_DEBOUNCE_MS = 150;
   const RENDER_THROTTLE_MS = 100;
@@ -41,6 +43,7 @@
     bestMove: null,
     searching: false,
     reachedDepth: 0,
+    cloudUsed: false,
   };
 
   let boardEl = null;
@@ -49,6 +52,9 @@
   let renderTimer = null;
   let uiTimer = null;
   let engineLaunch = null;              // in-flight launch promise
+  let cloudReqId = 0;                   // invalidates stale cloud answers
+  let cloudFallbackTimer = null;
+  let searchWatchdog = null;
 
   const engineCtl = { port: null, ready: false };   // port = background-page channel
 
@@ -205,7 +211,12 @@
       // Clocks (approximate move counter — irrelevant for move quality).
       S.halfmove = (kind === "P" || capture) ? 0 : S.halfmove + 1;
       if (S.sideToMove === "b") S.fullmove += 1;
-      S.sideToMove = S.sideToMove === "w" ? "b" : "w";
+      // Anchor the side to move to the OBSERVED mover's colour instead of
+      // blind-flipping the previous value: if a board mutation is ever
+      // missed, a stateful flip stays inverted FOREVER and analysis
+      // silently stops firing (the "stops working until refresh" bug).
+      // Re-anchoring on every observed move self-heals immediately.
+      S.sideToMove = main.code[0] === "w" ? "b" : "w";
     }
 
     S.pieces = next;
@@ -309,6 +320,15 @@
           scheduleRender();
           return;
         }
+        if (msg && typeof msg === "object" && msg.cloud) {
+          applyCloudResult(msg.cloud);
+          return;
+        }
+        if (msg && typeof msg === "object" && msg.cloudError) {
+          console.warn("[chessable] cloud:", msg.cloudError);
+          if (S.searching && S.fen) localSearch(S.fen);   // seamless fallback
+          return;
+        }
         if (msg && msg.ready) {
           // Worker process exists. Kick off the UCI handshake — Stockfish
           // only replies "uciok" AFTER receiving "uci".
@@ -352,6 +372,7 @@
 
   function handleEngineLine(line) {
     if (line.startsWith("bestmove")) {
+      clearSearchWatchdog();
       S.searching = false;
       const mv = line.split(/\s+/)[1];
       S.bestMove = mv && mv !== "(none)" ? mv : null;
@@ -388,7 +409,30 @@
     S.bestMove = null;
     S.searching = true;
     S.reachedDepth = 0;
-    post("stop");                              // cancel any previous search
+    S.cloudUsed = false;
+    scheduleRender();
+    armSearchWatchdog();
+
+    // Cloud first: a real multi-threaded Stockfish on server hardware
+    // answers at far greater depth than a phone can and in a few hundred
+    // ms — without burning the battery. The local WASM engine stays warm
+    // and takes over automatically on any cloud failure or timeout.
+    const id = ++cloudReqId;
+    try {
+      engineCtl.port.postMessage({ __cloud: fen, depth: S.depth });
+    } catch (_) {
+      localSearch(fen);                    // port already dead
+      return;
+    }
+    clearTimeout(cloudFallbackTimer);
+    cloudFallbackTimer = setTimeout(() => {
+      if (id === cloudReqId && S.running && S.searching) localSearch(fen);
+    }, CLOUD_TIMEOUT_MS);
+  }
+
+  function localSearch(fen) {
+    if (!S.running) return;
+    post("stop");                          // cancel any previous search
     post(`position fen ${fen}`);
     // Depth AND time limited: Stockfish stops at whichever comes first. The
     // depth box is a quality CAP — easy positions still reach it instantly —
@@ -396,6 +440,52 @@
     // middlegames (a bare depth-18 search can grind for 4-8 s on a phone).
     post(`go depth ${S.depth} movetime ${MOVETIME_MS}`);
     scheduleRender();
+  }
+
+  function applyCloudResult(c) {
+    if (!S.running || !S.searching) return;             // stale or stopped
+    if (!c || typeof c.move !== "string" || c.move.length < 4) {
+      if (S.fen) localSearch(S.fen);                    // malformed — fall back
+      return;
+    }
+    clearSearchWatchdog();
+    clearTimeout(cloudFallbackTimer);
+    S.searching = false;
+    S.cloudUsed = true;
+    S.bestMove = c.move;
+    S.reachedDepth = Number(c.depth) || 0;
+    const mate = c.mate != null ? Number(c.mate) : null;
+    const cp = Number(c.centipawns);
+    S.results[0] =
+      mate != null && Number.isFinite(mate) && mate !== 0
+        ? { depth: S.reachedDepth, type: "mate", value: mate, pv: c.move }
+        : { depth: S.reachedDepth, type: "cp", value: Number.isFinite(cp) ? cp : 0, pv: c.move };
+    scheduleRender();
+  }
+
+  function armSearchWatchdog() {
+    clearSearchWatchdog();
+    searchWatchdog = setTimeout(() => {
+      searchWatchdog = null;
+      if (!S.running || !S.searching) return;
+      // No answer of any kind for 15 s — the engine host is wedged (e.g.
+      // Firefox suspended the background page mid-search and the port died
+      // without ever firing onDisconnect). Tear it down and re-boot.
+      forceEngineRestart("no answer for 15s");
+    }, SEARCH_WATCHDOG_MS);
+  }
+
+  function clearSearchWatchdog() {
+    clearTimeout(searchWatchdog);
+    searchWatchdog = null;
+  }
+
+  function forceEngineRestart(why) {
+    console.warn("[chessable] restarting engine host:", why);
+    try { engineCtl.port && engineCtl.port.disconnect(); } catch (_) {}
+    engineCtl.port = null;
+    engineCtl.ready = false;
+    startEngine().catch(showEngineError);
   }
 
   /* ------------------------------------------------------------------ */
@@ -596,7 +686,7 @@
         : `target d${S.depth}`;
       refs.depthInfo.style.display = "";
     } else {
-      refs.depthInfo.textContent = `d${S.reachedDepth}/${S.depth}`;
+      refs.depthInfo.textContent = `d${S.reachedDepth}/${S.depth}${S.cloudUsed ? " \u2601" : ""}`;
       refs.depthInfo.style.display = "";
     }
 
@@ -703,6 +793,9 @@
   function showEngineError(err) {
     console.error("[chessable]", err);
     if (!S.running) return;
+    clearSearchWatchdog();
+    clearTimeout(cloudFallbackTimer);
+    cloudReqId++;                             // invalidate in-flight cloud asks
     S.running = false;
     S.engineError = true;
     clearHighlights();
@@ -711,6 +804,9 @@
 
   function stopHack() {
     S.running = false;
+    clearSearchWatchdog();
+    clearTimeout(cloudFallbackTimer);
+    cloudReqId++;                             // invalidate in-flight cloud asks
     post("stop");
     observer?.disconnect();
     observer = null;

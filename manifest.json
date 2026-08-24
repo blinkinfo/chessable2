@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chessable",
-  "version": "4.1.0",
+  "version": "4.2.0",
   "icons": {
     "16": "icon-16.png",
     "48": "icon-48.png",
@@ -12,10 +12,11 @@
       "id": "chessable-stockfish@blinkinfo.dev",
       "strict_min_version": "142.0",
       "data_collection_permissions": {
-        "required": ["none"]
+        "required": ["websiteContent"]
       }
     }
   },
+  "host_permissions": ["https://chess-api.com/*"],
   "description": "Subtle Stockfish 18 (NNUE) best-move overlay for chess.com.",
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
