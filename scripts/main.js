@@ -439,11 +439,17 @@
   function highlightMove(bestUci) {
     clearHighlights();
     if (!bestUci || bestUci.length < 4) return;
+    const board = boardEl && boardEl.isConnected ? boardEl : getBoard();
+    if (!board) return;
     for (const square of [bestUci.slice(0, 2), bestUci.slice(2, 4)]) {
       const el = document.createElement("div");
+      // chess.com positions squares via absolute numeric classes (square-47
+      // = g4) regardless of board flip — same scheme its own move highlights
+      // use, so the overlay inherits correct size and placement automatically.
       el.className = `highlight cheat-highlight square-${algToClass(square)}`;
-      el.style.cssText = "background:#81b64c;opacity:0.45;";
-      boardEl.appendChild(el);
+      el.style.cssText =
+        "background:#81b64c !important;opacity:0.55;pointer-events:none;";
+      board.appendChild(el);
     }
   }
 
@@ -531,6 +537,13 @@
   function renderPanel() {
     if (!refs.dot || !document.getElementById("cc-panel")) return;
     const best = S.results[0];
+
+    // Board highlight always mirrors the pill: green from/to squares while a
+    // best move is showing, cleared the moment there isn't one (new position,
+    // engine off, engine error). This is the ONLY place highlights are drawn,
+    // so they can never go stale or desync from the pill.
+    if (S.running && S.bestMove && !S.engineError) highlightMove(S.bestMove);
+    else clearHighlights();
 
     if (refs.depth) refs.depth.value = String(S.depth);
 
