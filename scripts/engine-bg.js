@@ -19,6 +19,7 @@
 
 let worker = null;
 let bootWatchdog = null;
+let lastBootInfo = null;      // most recent diagnostic from the boot worker
 const ports = new Set();
 
 function broadcast(what) {
@@ -45,19 +46,29 @@ function clearBootWatchdog() {
 function ensureWorker(port) {
   if (worker) return true;
   try {
-    worker = new Worker(chrome.runtime.getURL("engine/stockfish-18-lite-single.js"));
-
-    // First line from the engine proves WASM compiled and UCI is alive.
-    const firstLine = () => {
-      worker.removeEventListener("message", firstLine);
-      clearBootWatchdog();
-    };
-    worker.addEventListener("message", firstLine);
+    lastBootInfo = null;
+    // Spawn the INSTRUMENTED bootstrap (engine/boot.js), not the glue
+    // directly. boot.js reports every boot stage back to us — wasm reach,
+    // Content-Type, WASM-compile permission, importScripts result — so a
+    // failure is always diagnosable from the pill, never a silent hang.
+    worker = new Worker(chrome.runtime.getURL("engine/boot.js"));
 
     worker.addEventListener("message", (e) => {
+      const d = e.data;
+      // Boot diagnostics from the bootstrap worker.
+      if (d && typeof d === "object" && typeof d.__boot === "string") {
+        lastBootInfo = d.__boot;
+        console.log("[chessable:bg]", d.__boot);
+        for (const p of ports) {
+          try { p.postMessage({ info: d.__boot }); } catch (_) {}
+        }
+        return;
+      }
+      const line = typeof d === "string" ? d : d && d.data;
+      if (typeof line !== "string") return;
       for (const p of ports) {
         try {
-          p.postMessage({ line: String(e.data) });
+          p.postMessage({ line: String(line) });
         } catch (_) {}
       }
     });
@@ -76,7 +87,7 @@ function ensureWorker(port) {
     bootWatchdog = setTimeout(() => {
       bootWatchdog = null;
       broadcast(
-        "engine silent for 15s — check extension CSP allows WebAssembly ('wasm-unsafe-eval')"
+        `engine silent for 15s${lastBootInfo ? ` — last: ${lastBootInfo}` : " — no boot diagnostics"}`
       );
       if (worker) {
         try { worker.terminate(); } catch (_) {}
