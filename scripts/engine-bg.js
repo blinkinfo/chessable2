@@ -17,12 +17,47 @@
 //     remaining silence into a fast, reported failure instead of a hang.
 "use strict";
 
-// Cloud analysis: a real multi-threaded Stockfish on server hardware
-// (chess-api.com — free, no key) answers at far greater depth than a phone
-// can and in a few hundred ms. The content script falls back to the local
-// WASM engine automatically if this fails or times out. Fetched here in
-// the background page, which has host permissions for the endpoint.
+// Cloud analysis, two tiers, both free and keyless:
+//
+//   1. lichess.org/api/cloud-eval — crowd-computed Stockfish analyses of
+//      known positions, depth 30-75(!), ~300 ms. Misses unique positions
+//      (404) — that just falls through to tier 2.
+//   2. chess-api.com/v1 — live multi-threaded Stockfish, depth ~13-15 on
+//      any position, ~500 ms.
+//
+// The content script falls back to the local WASM engine automatically if
+// both fail. NOTE the score conventions differ: lichess cp is WHITE-relative,
+// chess-api is SIDE-TO-MOVE relative — results are tagged with their source
+// so the content script can convert correctly. Fetched here in the
+// background page, which has host permissions for both endpoints.
+const LICHESS_URL = "https://lichess.org/api/cloud-eval";
 const CLOUD_URL = "https://chess-api.com/v1";
+
+async function lichessEval(fen) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 2500);
+  try {
+    const resp = await fetch(
+      `${LICHESS_URL}?fen=${encodeURIComponent(fen)}&multiPv=1`,
+      { signal: ctl.signal }
+    );
+    if (!resp.ok) throw new Error(`lichess ${resp.status}`);
+    const d = await resp.json();
+    const pv = d && d.pvs && d.pvs[0];
+    const move = pv && typeof pv.moves === "string" ? pv.moves.trim().split(/\s+/)[0] : null;
+    if (!move || move.length < 4) throw new Error("no lichess pv");
+    return {
+      source: "lichess",              // cp/mate are WHITE-relative
+      move,
+      centipawns: pv.cp,
+      mate: pv.mate != null ? pv.mate : null,
+      depth: d.depth,
+      fen,
+    };
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 async function cloudEval(fen, depth) {
   const ctl = new AbortController();
@@ -38,9 +73,24 @@ async function cloudEval(fen, depth) {
     const d = await resp.json();
     if (d && d.type === "error") throw new Error(d.error || "cloud error");
     if (!d || typeof d.move !== "string") throw new Error("no move in cloud response");
-    return { move: d.move, centipawns: d.centipawns, mate: d.mate, depth: d.depth };
+    return {
+      source: "cloud",                // cp/mate are SIDE-TO-MOVE relative
+      move: d.move,
+      centipawns: d.centipawns,
+      mate: d.mate,
+      depth: d.depth,
+      fen,
+    };
   } finally {
     clearTimeout(t);
+  }
+}
+
+async function bestCloudEval(fen, depth) {
+  try {
+    return await lichessEval(fen);      // deepest (30-75) when cached
+  } catch (_) {
+    return await cloudEval(fen, depth); // live engine for unique positions
   }
 }
 
@@ -163,7 +213,7 @@ chrome.runtime.onConnect.addListener((port) => {
     // Cloud analysis request — answered from the background page (it has
     // the host permission; content-script fetches would face page CORS).
     if (msg && typeof msg === "object" && typeof msg.__cloud === "string") {
-      cloudEval(msg.__cloud, msg.depth)
+      bestCloudEval(msg.__cloud, msg.depth)
         .then((r) => {
           try { port.postMessage({ cloud: r }); } catch (_) {}
         })
@@ -181,10 +231,18 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 
   port.onDisconnect.addListener(() => {
-    if (ports.size === 0 && worker) {
-      try {
-        worker.postMessage("stop");
-      } catch (_) {}
-    }
-  });
+      if (ports.size === 0 && worker) {
+        try {
+          worker.postMessage("stop");
+        } catch (_) {}
+        // Terminate and drop the worker, don't just pause it: the content
+        // script's watchdog restarts by RECONNECTING, and ensureWorker()
+        // would otherwise hand the fresh connection the same possibly-wedged
+        // worker — leaving the pill idle forever (the "refresh to fix" bug).
+        try {
+          worker.terminate();
+        } catch (_) {}
+        worker = null;
+      }
+    });
 });

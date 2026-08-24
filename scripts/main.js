@@ -44,6 +44,7 @@
     searching: false,
     reachedDepth: 0,
     cloudUsed: false,
+    noMoveFen: null,                      // last position where the game ended
   };
 
   let boardEl = null;
@@ -376,6 +377,7 @@
       S.searching = false;
       const mv = line.split(/\s+/)[1];
       S.bestMove = mv && mv !== "(none)" ? mv : null;
+      if (!S.bestMove) S.noMoveFen = S.fen;      // game over — don't re-spin
       scheduleRender();
       return;
     }
@@ -444,6 +446,9 @@
 
   function applyCloudResult(c) {
     if (!S.running || !S.searching) return;             // stale or stopped
+    // Stale-answer protection: a slow cloud reply for a PREVIOUS position
+    // must never be shown for the current one.
+    if (c && typeof c.fen === "string" && S.fen && c.fen !== S.fen) return;
     if (!c || typeof c.move !== "string" || c.move.length < 4) {
       if (S.fen) localSearch(S.fen);                    // malformed — fall back
       return;
@@ -454,12 +459,23 @@
     S.cloudUsed = true;
     S.bestMove = c.move;
     S.reachedDepth = Number(c.depth) || 0;
-    const mate = c.mate != null ? Number(c.mate) : null;
-    const cp = Number(c.centipawns);
+
+    // Score conventions: chess-api is side-to-move relative (UCI standard);
+    // lichess cloud-eval is WHITE-relative. Normalise to side-to-move
+    // relative, which formatScore() expects.
+    const whiteRel = c.source === "lichess";
+    const turn = S.fen ? S.fen.split(" ")[1] : S.sideToMove;
+    const sign = whiteRel ? (turn === "w" ? 1 : -1) : 1;
+    let mate = c.mate != null ? Number(c.mate) : null;
+    if (mate != null && Number.isFinite(mate)) mate *= sign;
+    else mate = null;
+    const cpRaw = Number(c.centipawns);
+    const cp = Number.isFinite(cpRaw) ? cpRaw * sign : 0;
+
     S.results[0] =
-      mate != null && Number.isFinite(mate) && mate !== 0
+      mate != null && mate !== 0
         ? { depth: S.reachedDepth, type: "mate", value: mate, pv: c.move }
-        : { depth: S.reachedDepth, type: "cp", value: Number.isFinite(cp) ? cp : 0, pv: c.move };
+        : { depth: S.reachedDepth, type: "cp", value: cp, pv: c.move };
     scheduleRender();
   }
 
@@ -482,10 +498,24 @@
 
   function forceEngineRestart(why) {
     console.warn("[chessable] restarting engine host:", why);
-    try { engineCtl.port && engineCtl.port.disconnect(); } catch (_) {}
-    engineCtl.port = null;
+    clearSearchWatchdog();
+    clearTimeout(cloudFallbackTimer);
+    cloudReqId++;
+    S.searching = false;
+    // Full teardown: disconnecting makes the background page TERMINATE the
+    // (possibly wedged) worker, and the fresh connection boots a new one.
+    // Restarting while reusing the old worker left the pill idle forever.
+    if (engineCtl.port) {
+      const p = engineCtl.port;
+      engineCtl.port = null;
+      try { p.disconnect(); } catch (_) {}
+    }
     engineCtl.ready = false;
-    startEngine().catch(showEngineError);
+    startEngine()
+      .then((ok) => {
+        if (ok && S.running) analyze();
+      })
+      .catch(showEngineError);
   }
 
   /* ------------------------------------------------------------------ */
@@ -835,6 +865,19 @@
     if (S.running) {
       if (engineCtl.port) {
         post("__ping");                          // keeps the bg page alive mid-game
+        // Safety net against ANY missed analysis trigger (observer hiccup,
+        // SPA quirk, drifted state): if it is our move, the engine is ready
+        // and nothing is running or answered, just analyse again.
+        if (
+          engineCtl.ready &&
+          S.sideToMove === S.playerColour &&
+          !S.searching &&
+          !S.bestMove &&
+          S.fen &&
+          S.fen !== S.noMoveFen                  // game-over position — don't spin
+        ) {
+          analyze();
+        }
       } else if (!engineLaunch && !S.engineError) {
         startEngine().catch(showEngineError);     // bg was suspended — re-arm
       }
