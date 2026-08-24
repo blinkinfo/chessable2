@@ -17,49 +17,15 @@
 //     remaining silence into a fast, reported failure instead of a hang.
 "use strict";
 
-// Cloud analysis, two tiers, both free and keyless:
-//
-//   1. lichess.org/api/cloud-eval — crowd-computed Stockfish analyses of
-//      known positions, depth 30-75(!), ~300 ms. Misses unique positions
-//      (404) — that just falls through to tier 2.
-//   2. chess-api.com/v1 — live multi-threaded Stockfish, depth ~13-15 on
-//      any position, ~500 ms.
-//
-// The content script falls back to the local WASM engine automatically if
-// both fail. NOTE the score conventions differ: lichess cp is WHITE-relative,
-// chess-api is SIDE-TO-MOVE relative — results are tagged with their source
-// so the content script can convert correctly. Fetched here in the
-// background page, which has host permissions for both endpoints.
-const LICHESS_URL = "https://lichess.org/api/cloud-eval";
+// Cloud analysis via chess-api.com — free, keyless, live multi-threaded
+// Stockfish on server hardware (depth ~13-15 on any position, ~500 ms).
+// Scores are SIDE-TO-MOVE relative. Fetched here in the background page,
+// which has the host permission (content-script fetches would face page
+// CORS). The content script falls back to the local WASM engine
+// automatically on any failure or timeout.
 const CLOUD_URL = "https://chess-api.com/v1";
 
-async function lichessEval(fen) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), 2500);
-  try {
-    const resp = await fetch(
-      `${LICHESS_URL}?fen=${encodeURIComponent(fen)}&multiPv=1`,
-      { signal: ctl.signal }
-    );
-    if (!resp.ok) throw new Error(`lichess ${resp.status}`);
-    const d = await resp.json();
-    const pv = d && d.pvs && d.pvs[0];
-    const move = pv && typeof pv.moves === "string" ? pv.moves.trim().split(/\s+/)[0] : null;
-    if (!move || move.length < 4) throw new Error("no lichess pv");
-    return {
-      source: "lichess",              // cp/mate are WHITE-relative
-      move,
-      centipawns: pv.cp,
-      mate: pv.mate != null ? pv.mate : null,
-      depth: d.depth,
-      fen,
-    };
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-async function cloudEval(fen, depth) {
+async function bestCloudEval(fen, depth) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 6000);
   try {
@@ -86,16 +52,9 @@ async function cloudEval(fen, depth) {
   }
 }
 
-async function bestCloudEval(fen, depth) {
-  try {
-    return await lichessEval(fen);      // deepest (30-75) when cached
-  } catch (_) {
-    return await cloudEval(fen, depth); // live engine for unique positions
-  }
-}
-
 let worker = null;
 let bootWatchdog = null;
+let bootComplete = false;    // true once the engine answered the UCI handshake
 let lastBootInfo = null;      // most recent diagnostic from the boot worker
 const BOOT_SILENCE_MS = 30000; // any worker message resets this — only TRUE silence fires it
 const ports = new Set();
@@ -139,6 +98,7 @@ function ensureWorker(port) {
   if (worker) return true;
   try {
     lastBootInfo = null;
+    bootComplete = false;
     // Spawn the INSTRUMENTED bootstrap (engine/boot.js), not the glue
     // directly. boot.js reports every boot stage back to us — wasm reach,
     // Content-Type, WASM-compile permission, importScripts result — so a
@@ -147,7 +107,13 @@ function ensureWorker(port) {
 
     worker.addEventListener("message", (e) => {
       const d = e.data;
-      kickWatchdog(); // ANY message (boot stage or engine line) = alive
+      // Feed the boot watchdog ONLY while booting. Re-arming it on every
+      // message forever used to KILL HEALTHY IDLE ENGINES mid-game: an
+      // engine waiting for the opponent's move is legitimately silent for
+      // minutes, the watchdog fired, terminated the worker, and the pill
+      // died until a page refresh. Boot silence is the only thing this
+      // watchdog exists for.
+      if (!bootComplete) kickWatchdog();
       // Boot diagnostics from the bootstrap worker.
       if (d && typeof d === "object" && typeof d.__boot === "string") {
         lastBootInfo = d.__boot;
@@ -159,9 +125,12 @@ function ensureWorker(port) {
       }
       const line = typeof d === "string" ? d : d && d.data;
       if (typeof line !== "string") return;
-      // The engine answered the UCI handshake — boot is complete, the
-      // silence watchdog has no business watching an idle healthy engine.
-      if (line === "uciok") clearBootWatchdog();
+      // The engine answered the UCI handshake — boot is complete. Disarm
+      // the silence watchdog permanently for this worker.
+      if (line === "uciok") {
+        bootComplete = true;
+        clearBootWatchdog();
+      }
       for (const p of ports) {
         try {
           p.postMessage({ line: String(line) });
@@ -177,12 +146,9 @@ function ensureWorker(port) {
       broadcast("engine produced an undecodable message")
     );
 
-    // Silence watchdog — resets on EVERY message from the worker, so a
-    // slow-but-progressing first boot (7 MB fetch + compile on mobile data
-    // can legitimately take 20-30 s) is never killed. Only total silence
-    // for 60 s — a genuinely wedged boot — fires it, and the last boot
-    // stage is included so the pill names exactly where it stopped.
-    kickWatchdog();
+    // Boot silence watchdog — resets on every message WHILE booting, so a
+    // slow first boot (7 MB fetch + compile on mobile data) is never
+    // killed. Disarmed for good once the engine answers "uciok".
 
     console.log("[chessable:bg] engine worker started");
     return true;
