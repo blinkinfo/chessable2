@@ -1,6 +1,7 @@
 // Chessable 2.1 — subtle Stockfish 18 (NNUE, WebAssembly) analysis for chess.com.
 // One quiet pill above the board: click to toggle, best move appears on the
-// board itself. Event-driven board watching, complete FEN reconstruction.
+// board itself (~1 s budget per move). Event-driven board watching,
+// complete FEN reconstruction.
 //
 // Engine binaries are NOT committed to the repo. Run `npm install`
 // (or `bun install`) so scripts/setup-engine.js copies them into engine/.
@@ -14,6 +15,7 @@
   const FILES = "abcdefgh";
   const MULTI_PV = 1;          // single principal variation (fastest)
   const HASH_MB = 64;          // transposition table (phone-friendly)
+  const MOVETIME_MS = 900;     // per-move thinking budget — keeps hints near-instant
   const ENGINE_READY_TIMEOUT_MS = 90000;   // max SILENCE during boot; any progress resets it
   const SYNC_DEBOUNCE_MS = 150;
   const RENDER_THROTTLE_MS = 100;
@@ -388,7 +390,11 @@
     S.reachedDepth = 0;
     post("stop");                              // cancel any previous search
     post(`position fen ${fen}`);
-    post(`go depth ${S.depth}`);               // NOTE: template literal (the old bug!)
+    // Depth AND time limited: Stockfish stops at whichever comes first. The
+    // depth box is a quality CAP — easy positions still reach it instantly —
+    // while MOVETIME_MS guarantees a move within ~1 s even in complex
+    // middlegames (a bare depth-18 search can grind for 4-8 s on a phone).
+    post(`go depth ${S.depth} movetime ${MOVETIME_MS}`);
     scheduleRender();
   }
 
@@ -499,7 +505,9 @@
     depthInput.min = "6";
     depthInput.max = "30";
     depthInput.value = String(S.depth);
-    depthInput.title = "Search depth (6\u201330). Higher = stronger but slower.";
+    depthInput.title =
+      "Max search depth (6\u201330). Moves are also capped at ~1 s of thinking, " +
+      "so higher depths only kick in for easy positions.";
     depthInput.style.cssText =
       "width:40px;padding:2px 3px;border-radius:4px;border:1px solid #3d3a37;" +
       "background:#211f1d;color:#c7c3bf;font-size:11px;text-align:center;" +
@@ -682,7 +690,14 @@
     attachObserver(board);
     S.running = true;
     renderPanel();                              // amber dot right away
-    startEngine().catch(showEngineError);
+    if (engineCtl.ready) {
+      // Engine already preloaded — analyse THIS position right now. (This
+      // was the bug: the ready path of startEngine() resolved without ever
+      // calling analyze(), so nothing happened until the next observed move.)
+      analyze();
+    } else {
+      startEngine().catch(showEngineError);     // launch path analyses on ready
+    }
   }
 
   function showEngineError(err) {
