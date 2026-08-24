@@ -44,6 +44,7 @@
     searching: false,
     reachedDepth: 0,
     cloudUsed: false,
+    lastAnalyzedFen: null,                // last position a search was issued for
     noMoveFen: null,                      // last position where the game ended
   };
 
@@ -124,6 +125,8 @@
     S.fullmove = 1;
     S.results = [];
     S.bestMove = null;
+    S.lastAnalyzedFen = null;
+    S.noMoveFen = null;
   }
 
   // Apply an observed position change: figures out what move(s) happened,
@@ -142,9 +145,13 @@
     if (!removed.length && !added.length) return false;
 
     // Pair each appearing piece with its source square by identical code.
+    // Self-pairs (same square AND code) are chess.com re-creating a piece
+    // node — NOT a move — and must be filtered out, or they would be
+    // misread as a null move and corrupt the turn tracking.
     const moves = [];
     const consumed = new Set();
     for (const a of added) {
+      if (prev.get(a.sq) === a.code) { consumed.add(a.sq); continue; } // node re-created in place
       const src = removed.find((r) => !consumed.has(r.sq) && r.code === a.code);
       if (src) {
         consumed.add(src.sq);
@@ -170,6 +177,15 @@
       }
     }
     moves.push(...promotions);
+
+    // A diff with no pairable move (mid-animation snapshot, drag ghost,
+    // partial re-render) must NOT touch tracked state — a corrupted
+    // snapshot or a wrong side-to-move used to silently kill all further
+    // analysis (the "stops working until refresh" bug). Ignore this
+    // observation entirely; the next stable one diffs cleanly against the
+    // snapshot we kept. (Every legal chess move removes a piece from its
+    // origin square, so a real move is always pairable.)
+    if (!moves.length) return false;
 
     // Anything still unaccounted for vanished => it was captured.
     const capture = removed.filter((r) => !consumed.has(r.sq)).length > 0 ||
@@ -309,7 +325,15 @@
       p.onMessage.addListener((msg) => {
         if (msg && msg.error) {
           console.error("[chessable] engine:", msg.error);
-          fail(msg.error);
+          if (engineCtl.ready) {
+            // Established session hit an error (e.g. the background's boot
+            // watchdog fired). fail() would reject an already-settled
+            // promise — a no-op that leaves ready=true with a dead port:
+            // the zombie state. Do a real restart instead.
+            forceEngineRestart(String(msg.error).slice(0, 42));
+          } else {
+            fail(msg.error);
+          }
           return;
         }
         if (msg && msg.info) {
@@ -372,6 +396,9 @@
   }
 
   function handleEngineLine(line) {
+    // Ignore everything from a search we already cancelled/superseded —
+    // trailing lines from a stopped engine must never overwrite state.
+    if (!S.searching) return;
     if (line.startsWith("bestmove")) {
       clearSearchWatchdog();
       S.searching = false;
@@ -406,7 +433,12 @@
   function analyze() {
     if (!engineCtl.ready || !S.running) return;
     const fen = buildFen();
+    // Cancel ANY in-flight local search from a previous position first —
+    // an un-cancelled search answers later and its stale bestmove/info
+    // lines would corrupt the new analysis' state.
+    post("stop");
     S.fen = fen;
+    S.lastAnalyzedFen = fen;
     S.results = [];
     S.bestMove = null;
     S.searching = true;
@@ -460,17 +492,11 @@
     S.bestMove = c.move;
     S.reachedDepth = Number(c.depth) || 0;
 
-    // Score conventions: chess-api is side-to-move relative (UCI standard);
-    // lichess cloud-eval is WHITE-relative. Normalise to side-to-move
-    // relative, which formatScore() expects.
-    const whiteRel = c.source === "lichess";
-    const turn = S.fen ? S.fen.split(" ")[1] : S.sideToMove;
-    const sign = whiteRel ? (turn === "w" ? 1 : -1) : 1;
-    let mate = c.mate != null ? Number(c.mate) : null;
-    if (mate != null && Number.isFinite(mate)) mate *= sign;
-    else mate = null;
+    // chess-api scores are SIDE-TO-MOVE relative — exactly what
+    // formatScore() expects, so they are used as-is.
+    const mate = c.mate != null ? Number(c.mate) : null;
     const cpRaw = Number(c.centipawns);
-    const cp = Number.isFinite(cpRaw) ? cpRaw * sign : 0;
+    const cp = Number.isFinite(cpRaw) ? cpRaw : 0;
 
     S.results[0] =
       mate != null && mate !== 0
@@ -494,6 +520,22 @@
   function clearSearchWatchdog() {
     clearTimeout(searchWatchdog);
     searchWatchdog = null;
+  }
+
+  // Retry button: healthy engine -> just re-analyse; anything doubtful ->
+  // full engine-host restart (fresh worker) and re-analyse.
+  function forceRetry() {
+    if (!S.running) {
+      startHack();
+      return;
+    }
+    S.engineError = false;
+    S.engineErrorMsg = null;
+    if (engineCtl.ready && engineCtl.port && !S.searching) {
+      analyze();
+    } else {
+      forceEngineRestart("manual retry");
+    }
   }
 
   function forceEngineRestart(why) {
@@ -654,7 +696,21 @@
       "display:none;font-size:10px;color:#8f8a86;font-variant-numeric:tabular-nums;";
     refs.depthInfo = depthInfo;
 
-    pill.append(dot, label, depthInput, move, evalTxt, depthInfo);
+    // Manual failsafe: force-restart the engine host and re-analyse, so a
+    // wedged session never requires a full page refresh.
+    const retry = document.createElement("span");
+    retry.textContent = "\u27f3";
+    retry.title = "Force restart the engine and re-analyse";
+    retry.style.cssText =
+      "display:none;cursor:pointer;color:#c7c3bf;font-size:13px;line-height:1;" +
+      "padding:0 3px;user-select:none;";
+    retry.addEventListener("click", (e) => {
+      e.stopPropagation();
+      forceRetry();
+    });
+    refs.retry = retry;
+
+    pill.append(dot, label, depthInput, move, evalTxt, depthInfo, retry);
     pill.addEventListener("click", () => (S.running ? stopHack() : startHack()));
     return pill;
   }
@@ -686,6 +742,10 @@
 
     if (refs.depth) refs.depth.value = String(S.depth);
 
+    // The retry button is visible whenever analysis is on — including the
+    // error state, where it is needed most.
+    refs.retry.style.display = "";
+
     if (S.engineError) {
       refs.dot.style.background = "#c0392b";            // red = engine failed
       refs.move.style.display = "none";
@@ -700,8 +760,10 @@
       refs.move.style.display = "none";
       refs.eval.style.display = "none";
       refs.depthInfo.style.display = "none";
+      refs.retry.style.display = "none";
       return;
     }
+    refs.retry.style.display = "";                      // visible while on
 
     // amber while the engine searches, green once a move is ready
     refs.dot.style.background = S.bestMove ? "#81b64c" : "#d4a72c";
@@ -749,7 +811,7 @@
       boardEl = board;
       snapshotPosition();
       attachObserver(board);
-      if (S.running && S.sideToMove === S.playerColour) analyze();
+      if (S.running) analyze();
       return;
     }
 
@@ -757,10 +819,13 @@
     if (!next.size) return;
     if (mapsEqual(next, S.pieces)) return;
 
-    applyMove(next);
-    // Only burn CPU analysing when it is actually our move.
-    if (S.running && S.sideToMove === S.playerColour) analyze();
-    else if (S.running) post("stop");
+    const changed = applyMove(next);
+    // Analyse EVERY confirmed position change — ours or the opponent's.
+    // Gating the trigger on tracked turn state is what made one missed or
+    // misread mutation stall the pill forever ("stops working until
+    // refresh"): the FEN comes straight from the DOM, so a search for the
+    // current position is always safe, whichever side is to move.
+    if (changed && S.running) analyze();
   }
 
   function mapsEqual(a, b) {
@@ -866,15 +931,20 @@
       if (engineCtl.port) {
         post("__ping");                          // keeps the bg page alive mid-game
         // Safety net against ANY missed analysis trigger (observer hiccup,
-        // SPA quirk, drifted state): if it is our move, the engine is ready
-        // and nothing is running or answered, just analyse again.
+        // SPA quirk, drifted state). The invariant is simple: the CURRENT
+        // board position must have a search issued for it. Re-run the full
+        // board sync (cheap, idempotent — it no-ops when nothing changed)
+        // and re-analyse whenever the invariant is violated. This makes a
+        // permanent stall structurally impossible: even if every trigger
+        // is missed, the pill self-heals within one heartbeat.
+        syncBoard();
+        const fen = S.pieces.size ? buildFen() : null;
         if (
           engineCtl.ready &&
-          S.sideToMove === S.playerColour &&
           !S.searching &&
-          !S.bestMove &&
-          S.fen &&
-          S.fen !== S.noMoveFen                  // game-over position — don't spin
+          fen &&
+          fen !== S.lastAnalyzedFen &&           // no search issued for THIS position yet
+          fen !== S.noMoveFen                    // game-over position — don't spin
         ) {
           analyze();
         }
