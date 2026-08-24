@@ -1,14 +1,17 @@
 // Instrumented Worker bootstrap for the Chessable engine.
 //
 // The background page spawns THIS script as the worker (not the engine glue
-// directly) so that every stage of the engine boot is observable. Any
-// failure is reported back with the exact stage that failed — no more
-// silent hangs. Stages travel to the background page as {__boot: "..."}
-// messages and are surfaced in the pill.
+// directly) so every stage of the boot is observable AND fast:
 //
-// The engine glue is imported AFTER self.__wasmUrl is set: the patched glue
-// uses that global as the wasm location (its own default would point at a
-// sibling of boot.js — wrong).
+//   1. The wasm is fetched ONCE and cached in IndexedDB — both the raw bytes
+//      AND the compiled WebAssembly.Module (Firefox supports structured-
+//      cloning compiled modules into IDB). Every later boot skips the
+//      network entirely and skips compilation too — near-instant start.
+//   2. The finished module is handed to the patched glue via
+//      self.__wasmModule (see setup-engine.js patch 4), so the glue never
+//      fetches anything itself.
+//   3. Every stage is reported back as {__boot: "..."} so a failure is
+//      always NAMED in the pill — never a silent hang.
 "use strict";
 
 function report(stage, detail) {
@@ -31,39 +34,111 @@ self.addEventListener("unhandledrejection", (e) => {
   report("unhandled rejection", r && r.message ? r.message : String(r));
 });
 
-// The engine glue reads this as the wasm location (see setup-engine.js
-// patch 2). Computed from THIS script's URL, so it is always the engine
-// wasm sitting next to it in engine/.
 const WASM_URL = new URL("stockfish-18-lite-single.wasm", self.location.href).href;
-self.__wasmUrl = WASM_URL;
-report("worker started", self.location.href);
+const GLUE_URL = new URL("stockfish-18-lite-single.js", self.location.href).href;
+const DB_NAME = "chessable-engine";
+const STORE = "wasm";
 
-// Stage check 1 — is WebAssembly compilation allowed at all? (Firefox MV3
-// blocks it unless the extension CSP includes 'wasm-unsafe-eval'; a block
-// here is silent for the glue, but not for us.)
-WebAssembly.instantiate(new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00])).then(
-  () => report("WebAssembly compile OK"),
-  (err) => report("WebAssembly BLOCKED", err && err.message)
-);
+report("boot: worker up", self.location.href);
 
-// Stage check 2 — is the wasm file reachable, and with which Content-Type?
-// Firefox's instantiateStreaming demands exactly "application/wasm"; we
-// compile from ArrayBuffer so the type no longer matters, but logging it
-// makes any serving problem visible.
-fetch(WASM_URL, { method: "HEAD" }).then(
-  (r) =>
-    report(
-      "engine wasm reachable",
-      `HTTP ${r.status} type=${r.headers.get("content-type") || "?"}`
-    ),
-  (err) => report("engine wasm unreachable", err && err.message)
-);
+/* ------------------------------------------------------------------ */
+/* Tiny IndexedDB helpers (promise-wrapped, fail-soft)                 */
+/* ------------------------------------------------------------------ */
 
-// Stage 3 — boot the engine glue itself (worker-mode branch).
-try {
-  importScripts("stockfish-18-lite-single.js");
-  report("engine glue loaded");
-} catch (err) {
-  report("engine glue FAILED to load", err && err.message);
-  throw err;
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
 }
+
+async function idbGet(key) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbPut(key, value) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Wasm acquisition: cache -> bytes -> compiled module                 */
+/* ------------------------------------------------------------------ */
+
+async function getWasmModule() {
+  // 1. Compiled-module cache — the golden path (no network, no compile).
+  try {
+    const hit = await idbGet("module");
+    if (hit instanceof WebAssembly.Module) {
+      report("boot: wasm module cache HIT — instant start");
+      return hit;
+    }
+  } catch (_) {/* cache unavailable — fall through */}
+
+  // 2. Raw-bytes cache (module cache miss, e.g. after a Firefox update).
+  let bytes = null;
+  try {
+    bytes = await idbGet("bytes");
+    if (bytes) report("boot: wasm bytes from cache");
+  } catch (_) {}
+
+  // 3. Network — first boot only.
+  if (!bytes) {
+    const t0 = Date.now();
+    const resp = await fetch(WASM_URL);
+    if (!resp.ok) throw new Error(`wasm fetch HTTP ${resp.status}`);
+    bytes = await resp.arrayBuffer();
+    report("boot: wasm fetched", `${(bytes.byteLength / 1048576).toFixed(1)} MB in ${Date.now() - t0}ms`);
+    try { await idbPut("bytes", bytes); } catch (_) {}
+  }
+
+  // 4. Compile once, cache the compiled module forever.
+  const t1 = Date.now();
+  const mod = await WebAssembly.compile(bytes);
+  report("boot: wasm compiled", `${Date.now() - t1}ms`);
+  try { await idbPut("module", mod); } catch (_) {}
+  return mod;
+}
+
+/* ------------------------------------------------------------------ */
+/* Boot sequence                                                       */
+/* ------------------------------------------------------------------ */
+
+(async () => {
+  // Permission probe — Firefox MV3 blocks WebAssembly unless the extension
+  // CSP includes 'wasm-unsafe-eval'. Silent for the glue; loud for us.
+  try {
+    await WebAssembly.instantiate(new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]));
+    report("boot: WebAssembly permission OK");
+  } catch (err) {
+    report("boot: WebAssembly BLOCKED", err && err.message);
+    throw err;
+  }
+
+  const mod = await getWasmModule();
+  self.__wasmModule = mod; // patched glue instantiates from this — no fetch
+
+  report("boot: loading engine glue");
+  try {
+    importScripts(GLUE_URL);
+  } catch (err) {
+    report("boot: glue FAILED to load", err && err.message);
+    throw err;
+  }
+  report("boot: glue loaded — waiting for engine init");
+})().catch((err) => {
+  report("boot FAILED", err && err.message ? err.message : String(err));
+});

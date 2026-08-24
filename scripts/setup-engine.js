@@ -8,28 +8,27 @@
 // fits AMO's per-file size limit whole (no splitting needed), and is far
 // stronger than the old Stockfish 10 asm.js the extension used originally.
 //
-// THREE PATCHES are applied to the copied glue — each fixes a real,
-// verified Firefox failure mode:
+// TWO patches are applied to the copied glue — each fixes a real,
+// verified failure mode:
 //
-// 1. Worker-mode check. The glue requires
-//    `self.location.hash.split(",")[1] === "worker"`, but Firefox strips
-//    URL fragments from Worker script URLs, so the check never passed and
-//    the engine silently never booted. Widened to the standard emscripten
-//    worker detection (`typeof importScripts`).
-//
-// 2. Explicit wasm URL. The glue defaults the wasm location to a sibling of
+// 1. Explicit wasm URL. The glue defaults the wasm location to a sibling of
 //    the *worker script*. We spawn an instrumented bootstrap worker
 //    (engine/boot.js), so that default would point at boot.wasm — a 404 and
-//    another silent death. The glue now honours `self.__wasmUrl`, which
-//    boot.js sets to the real engine wasm URL before importScripts.
+//    a silent death. The glue now honours `self.__wasmUrl`, which boot.js
+//    sets to the real engine wasm URL before importScripts.
 //
-// 3. MIME-independent WASM compile. The glue's custom instantiateWasm feeds
-//    its downloaded Response straight into WebAssembly.instantiateStreaming,
-//    which Firefox hard-fails unless Content-Type is exactly
-//    "application/wasm" — with no fallback (unlike emscripten's built-in
-//    path). If moz-extension:// ever serves .wasm with a different MIME the
-//    engine dies silently. We compile from the ArrayBuffer instead, which
-//    ignores Content-Type entirely.
+// 2. Pre-compiled module fast path. boot.js compiles the wasm ONCE (with an
+//    IndexedDB cache of the bytes AND the compiled WebAssembly.Module) and
+//    hands it to the glue via self.__wasmModule. The glue then instantiates
+//    from the ready-made module — no per-boot network fetch, no streaming-
+//    compile MIME pitfalls (Firefox demands exactly "application/wasm" for
+//    instantiateStreaming), and re-boots are near-instant.
+//
+// NOTE: the glue's own worker-branch detection is CORRECT for our use (a
+// plain worker with no URL fragment boots via its `typeof onmessage` path).
+// An earlier patch here replaced its hash check with a `typeof
+// importScripts` check — that SHORT-CIRCUITED the whole condition chain and
+// silently turned the glue into a no-op inside every worker. Do not reintroduce it.
 "use strict";
 
 const fs = require("fs");
@@ -45,19 +44,14 @@ const BOOT = "boot.js";
 
 const PATCHES = [
   {
-    name: "worker-mode check (Firefox strips worker URL fragments)",
-    old: `"worker"===self.location.hash.split(",")[1]`,
-    new: `"function"==typeof importScripts`,
-  },
-  {
     name: "explicit wasm URL via self.__wasmUrl (set by engine/boot.js)",
     old: `u=decodeURIComponent(e[0]||location.origin+location.pathname.replace(/\\.js$/i,".wasm"))`,
-    new: `u=decodeURIComponent(e[0]||self.__wasmUrl||location.origin+location.pathname.replace(/\\.js$/i,".wasm"))`,
+    new: `u=self.__wasmUrl||decodeURIComponent(e[0]||location.origin+location.pathname.replace(/\\.js$/i,".wasm"))`,
   },
   {
-    name: "MIME-independent WASM compile (no instantiateStreaming)",
-    old: `a(u,e).then(function(e){return WebAssembly.instantiateStreaming(e,n)})`,
-    new: `a(u,e).then(function(e){return e.arrayBuffer().then(function(e){return WebAssembly.instantiate(e,n)})})`,
+    name: "pre-compiled module fast path via self.__wasmModule",
+    old: `instantiateWasm:function(n,t){var e=i();`,
+    new: `instantiateWasm:function(n,t){if(self.__wasmModule)return WebAssembly.instantiate(self.__wasmModule,n).then(function(e){return t(e,self.__wasmModule),e.exports});var e=i();`,
   },
 ];
 

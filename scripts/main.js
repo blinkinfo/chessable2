@@ -14,7 +14,7 @@
   const FILES = "abcdefgh";
   const MULTI_PV = 1;          // single principal variation (fastest)
   const HASH_MB = 64;          // transposition table (phone-friendly)
-  const ENGINE_READY_TIMEOUT_MS = 30000;   // lite engine boots in seconds
+  const ENGINE_READY_TIMEOUT_MS = 90000;   // max SILENCE during boot; any progress resets it
   const SYNC_DEBOUNCE_MS = 150;
   const RENDER_THROTTLE_MS = 100;
 
@@ -268,11 +268,21 @@
     return new Promise((resolve, reject) => {
       const p = chrome.runtime.connect({ name: "chessable-engine" });
 
-      // Generous guard: even a cold first boot finishes in a few seconds.
-      const timer = setTimeout(
-        () => fail("engine did not initialise"),
+      // Silence guard — RESET on every sign of progress (boot stage reports,
+      // engine output). A slow first boot (7 MB fetch + compile on mobile
+      // data) streams progress the whole way and is never killed; only true
+      // silence fails, and the last boot stage is in S.bootInfo for the pill.
+      let timer = setTimeout(
+        () => fail(`no engine progress for ${ENGINE_READY_TIMEOUT_MS / 1000}s`),
         ENGINE_READY_TIMEOUT_MS
       );
+      const kick = () => {
+        clearTimeout(timer);
+        timer = setTimeout(
+          () => fail(`no engine progress for ${ENGINE_READY_TIMEOUT_MS / 1000}s`),
+          ENGINE_READY_TIMEOUT_MS
+        );
+      };
 
       function fail(why) {
         clearTimeout(timer);
@@ -293,6 +303,7 @@
           // Shown in the pill while booting so progress is always visible.
           console.log("[chessable] boot:", msg.info);
           S.bootInfo = String(msg.info).slice(0, 60);
+          kick(); // progress — keep the guard patient
           scheduleRender();
           return;
         }
@@ -305,6 +316,7 @@
         }
         const line = msg ? msg.line : null;
         if (typeof line !== "string") return;
+        kick(); // engine output — alive
 
         if (line.startsWith("uciok")) {
           configure();
