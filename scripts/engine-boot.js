@@ -42,6 +42,36 @@ const STORE = "wasm";
 report("boot: worker up", self.location.href);
 
 /* ------------------------------------------------------------------ */
+/* Early-command queue                                                 */
+/*                                                                     */
+/* The content script sends "uci" the moment the worker exists — but    */
+/* any message delivered to a worker BEFORE its script arms `onmessage` */
+/* is silently discarded by the browser. With a warm cache the glue     */
+/* loads a second or two after that first "uci", so it used to be       */
+/* dropped and the engine sat silent forever. We buffer early messages  */
+/* via addEventListener — which deliberately does NOT occupy the        */
+/* `onmessage` slot (the glue installs its dispatcher with              */
+/* `onmessage = onmessage || fn`) — and replay them once it exists.     */
+/* ------------------------------------------------------------------ */
+
+const __early = [];
+self.addEventListener("message", (e) => {
+  if (typeof self.onmessage !== "function") __early.push(e && e.data);
+});
+
+function flushEarly() {
+  if (typeof self.onmessage !== "function") return false;
+  while (__early.length) {
+    try {
+      self.onmessage({ data: __early.shift() });
+    } catch (err) {
+      report("dispatch error", err && err.message);
+    }
+  }
+  return true;
+}
+
+/* ------------------------------------------------------------------ */
 /* Tiny IndexedDB helpers (promise-wrapped, fail-soft)                 */
 /* ------------------------------------------------------------------ */
 
@@ -139,6 +169,16 @@ async function getWasmModule() {
     throw err;
   }
   report("boot: glue loaded — waiting for engine init");
+
+  // Replay anything that arrived during boot. The glue normally installs
+  // its dispatcher synchronously at importScripts time; retry briefly in
+  // case a future glue defers it.
+  const t0 = Date.now();
+  (function tryFlush() {
+    if (flushEarly()) return;
+    if (Date.now() - t0 < 10000) setTimeout(tryFlush, 50);
+    else report("boot: glue installed no command dispatcher");
+  })();
 })().catch((err) => {
   report("boot FAILED", err && err.message ? err.message : String(err));
 });
