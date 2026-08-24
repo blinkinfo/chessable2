@@ -17,6 +17,7 @@ OUT="chessable-firefox.xpi"
 
 for f in manifest.json icon-16.png icon-48.png icon-128.png scripts/main.js \
          scripts/engine-bg.js \
+         engine/boot.js \
          engine/stockfish-18-lite-single.js \
          engine/stockfish-18-lite-single.wasm; do
   if [ ! -f "$f" ]; then
@@ -28,6 +29,7 @@ done
 rm -f "$OUT"
 zip -q -X "$OUT" manifest.json icon-16.png icon-48.png icon-128.png \
   scripts/main.js scripts/engine-bg.js \
+  engine/boot.js \
   engine/stockfish-18-lite-single.js \
   engine/stockfish-18-lite-single.wasm
 

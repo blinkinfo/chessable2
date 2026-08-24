@@ -288,6 +288,14 @@
           fail(msg.error);
           return;
         }
+        if (msg && msg.info) {
+          // Boot diagnostic from the instrumented worker (stage reports).
+          // Shown in the pill while booting so progress is always visible.
+          console.log("[chessable] boot:", msg.info);
+          S.bootInfo = String(msg.info).slice(0, 60);
+          scheduleRender();
+          return;
+        }
         if (msg && msg.ready) {
           // Worker process exists. Kick off the UCI handshake — Stockfish
           // only replies "uciok" AFTER receiving "uci".
@@ -536,7 +544,7 @@
 
     // Live depth confirmation: progress toward the configured target.
     if (!engineCtl.ready) {
-      refs.depthInfo.textContent = "engine\u2026";
+      refs.depthInfo.textContent = S.bootInfo ? S.bootInfo : "engine\u2026";
       refs.depthInfo.style.display = "";
     } else if (!S.bestMove) {
       refs.depthInfo.textContent = best
@@ -632,6 +640,7 @@
     if (!board || S.running) return;
     S.engineError = false;
     S.engineErrorMsg = null;
+    S.bootInfo = null;
     boardEl = board;
     snapshotPosition();
     attachObserver(board);
